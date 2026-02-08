@@ -1,14 +1,17 @@
+import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Thread
 
 import requests
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QHBoxLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QHBoxLayout, QLabel, QSizePolicy
 from qfluentwidgets import (SingleDirectionScrollArea, FluentIcon as FIF,
                             Pivot, ToolButton, LineEdit, ProgressBar, BodyLabel)
 
+from config import cfg, Url
 from .component.card import Card
 from .logic import fileSha1
 
@@ -20,7 +23,8 @@ class BaseVersionPage(QWidget):
         self._type = _type
         self._count = 0
         _p = self.parent().parent()
-        self.d = self.parent().downloadVersion
+        _d = self.parent().downloadVersion
+        self.d = lambda url, ver: Thread(target=_d, args=(url, ver)).start()
         self._v = getattr(_p, f"{self._type[0].lower()}{self._type[1:]}Version")
         getattr(_p, f"update{_type.capitalize()}").connect(self.updateData)     # 更想数据时重新绘制
         self.initUI()
@@ -29,7 +33,7 @@ class BaseVersionPage(QWidget):
         mainLayout = QVBoxLayout()
 
         self.scrollArea = SingleDirectionScrollArea()
-        self.scrollArea.verticalScrollBar().valueChanged.connect(lambda value: self.on_scroll(value))
+        self.scrollArea.verticalScrollBar().valueChanged.connect(self.on_scroll)
         self.scrollArea.setStyleSheet("background-color: rgba(255, 255, 255, 0)")
 
         self.contentWidget = QWidget()
@@ -80,14 +84,41 @@ class BaseVersionPage(QWidget):
                 self.contentLayout.addWidget(card)
 
 class DownloadInfoPage(QWidget):
+    totalFile = Signal(int)
+    addFile = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("DownloadInfoPage")
+        self.file = 0
+        self.totalFile.connect(self._totalFile)
+        self.addFile.connect(self._addFile)
 
         self.initUI()
 
+    def _addFile(self):
+        self.file += 1
+        total = self.totalFileBar.maximum()
+        self.totalFilePercentText.setText(f"{self.file/total*100:.2f}% ({self.file}/{total})")
+        self.totalFileBar.setValue(self.file)
+
+    def _totalFile(self, total: int):
+        self.totalFilePercentText.setText(f"{self.file/max(1, total)*100:.2f}% ({self.file}/{max(1, total)})")
+        self.totalFileBar.setRange(0, total)
+        self.totalFileBar.setValue(0)
+
     def initUI(self):
         self.mainLayout = QVBoxLayout()
+
+        # 下载信息
+        self.scrollArea = SingleDirectionScrollArea()
+        self.contentWidget = QWidget()
+        self.contentLayout = QVBoxLayout(self.contentWidget)
+        self.scrollArea.setStyleSheet("background-color: transparent")
+        self.scrollArea.setWidgetResizable(True)
+        self.contentLayout.addStretch()
+        self.scrollArea.setWidget(self.contentWidget)
+        self.mainLayout.addWidget(self.scrollArea)
 
         # 文件下载进度
         self.downloadFileLayout = QVBoxLayout()
@@ -101,7 +132,7 @@ class DownloadInfoPage(QWidget):
         # 进度条
         self.downloadFileBar = ProgressBar()
         self.downloadFileBar.setRange(0, 384)
-        self.downloadFileBar.setValue(180)
+        self.downloadFileBar.setValue(0)
         self.downloadFileLayout.addLayout(self.downloadFileTextLayout)
         self.downloadFileLayout.addWidget(self.downloadFileBar)
 
@@ -115,22 +146,25 @@ class DownloadInfoPage(QWidget):
         self.totalFileTextLayout.addStretch()
         self.totalFileTextLayout.addWidget(self.totalFilePercentText)
         # 进度条
-        totalFileBar = ProgressBar()
-        totalFileBar.setRange(0, 384)
-        totalFileBar.setValue(180)
+        self.totalFileBar = ProgressBar()
+        self.totalFileBar.setRange(0, 384)
+        self.totalFileBar.setValue(0)
         self.totalFileLayout.addLayout(self.totalFileTextLayout)
-        self.totalFileLayout.addWidget(totalFileBar)
+        self.totalFileLayout.addWidget(self.totalFileBar)
 
-        self.mainLayout.addStretch()
+        # self.mainLayout.addStretch()
         self.mainLayout.addLayout(self.downloadFileLayout)
         self.mainLayout.addLayout(self.totalFileLayout)
 
         self.setLayout(self.mainLayout)
 
 class DownloadPage(QWidget):
+    addInfoToDownload = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("DownloadPage")
+        self.addInfoToDownload.connect(self._addInfoToDownload)
 
         self.initUI()
 
@@ -139,10 +173,11 @@ class DownloadPage(QWidget):
 
         self.stackedWidget = QStackedWidget(self)
         self.downloadInfoPage = DownloadInfoPage(self)
+        # self.downloadInfoPage.contentLayout.addWidget(BodyLabel("AAA"))
 
         self.addSubInterface(BaseVersionPage(self, "release"), "正式版")
         self.addSubInterface(BaseVersionPage(self, "snapshot"), "预览版")
-        # self.addSubInterface(BaseVersionPage(self, "ancient"), "远古版")
+        self.addSubInterface(BaseVersionPage(self, "old"), "远古版")
         # self.addSubInterface(BaseVersionPage(self, "aprFool"), "愚人节版")
 
         mainLayout = QVBoxLayout()
@@ -179,35 +214,98 @@ class DownloadPage(QWidget):
         )
 
     def downloadVersion(self, ver, url: str):
-        baseDir = Path(os.getcwd()) / ".minecraft"
+        baseDir = Path(cfg.minecraftPath.value)
         versionDir = baseDir / "versions" / ver
         assetsDir = baseDir / "assets"
         librariesDir = baseDir / "libraries"
 
+        self.addInfoToDownload.emit(f"📁 创建目录结构: {ver}")
         versionDir.mkdir(parents=True, exist_ok=True)
         assetsDir.mkdir(parents=True, exist_ok=True)
         librariesDir.mkdir(parents=True, exist_ok=True)
-        print(f"📁 创建目录结构: {ver}")
 
-    def downloadFile(self, url: str, path: Path, sha1: str = None):
+        self.addInfoToDownload.emit(f"⬇️ 下载版本JSON文件: {url}")
+        self.downloadInfoPage.totalFile.emit(1)
+        self.downloadFile(url, versionDir / f"{ver}.json", url.split("/")[-2])
+        with open(versionDir / f"{ver}.json", "r", encoding="utf-8") as f:
+            verData = json.load(f)
+        self.downloadInfoPage.addFile.emit()
+
+        _client = verData['downloads']['client']
+        self.downloadInfoPage.totalFile.emit(1)
+        self.addInfoToDownload.emit(f"⬇️ 下载客户端JAR: {ver}.jar")
+        self.downloadFile(_client["url"], versionDir / f"{ver}.jar", _client["sha1"])
+        self.downloadInfoPage.addFile.emit()
+
+        assetIndex = verData["assetIndex"]
+        assetIndexPath = assetsDir / "indexes" / f"{assetIndex['id']}.json"
+        assetIndexPath.parent.mkdir(parents=True, exist_ok=True)
+        self.downloadInfoPage.totalFile.emit(1)
+        self.addInfoToDownload.emit(f"⬇️ 下载资源索引: {assetIndex['url']}")
+        self.downloadFile(assetIndex['url'], assetIndexPath, assetIndex["sha1"])
+        self.downloadInfoPage.addFile.emit()
+
+        self.addInfoToDownload.emit(f"⬇️ 开始下载资源文件")
+        with open(assetIndexPath, "r", encoding="utf-8") as f:
+            assetIndexData: dict = json.load(f)["objects"]
+        self.downloadInfoPage.totalFile.emit(len(assetIndexData))
+
+        with ThreadPoolExecutor(max_workers=cfg.downloadTask.value) as executor:
+            futures = []
+            for _, data in assetIndexData.items():
+                path = Path(data["hash"][:2]) / data["hash"]
+                futures.append(executor.submit(
+                    self.downloadFile,
+                    cfg.versionsOrigin.value.value.Assets / path,
+                    assetsDir / "objects" / path,
+                    data["hash"],
+                    False
+                ))
+
+            for future in as_completed(futures):
+                if not future.result()[0]:
+                    self.addInfoToDownload.emit(f"❌ 下载文件 {future.result()[1]} 时发生错误")
+                self.downloadInfoPage.addFile.emit()
+
+        self.addInfoToDownload.emit(f"✅ 资源文件下载完成")
+
+
+    def downloadFile(self, url: Url, path: Path, sha1: str = None, su: bool = True):
         headResp = None
+        url = Url(url)
+        if isinstance(path, str): path = Path(path)
 
         if path.exists():
-            if sha1 and fileSha1(path) == sha1: return True
+            if sha1 and fileSha1(path) == sha1:
+                if su: self.addInfoToDownload.emit(f"   ✓ 下载完成: {path.name}")
+                return True, path.name
             try:
-                headResp = requests.head(url, timeout=10) if headResp is None else headResp
+                headResp = requests.head(url, timeout=cfg.downloadTimeout.value) if headResp is None else headResp
                 if headResp.status_code == 200:
                     remote_size = int(headResp.headers.get('Content-Length', 0))
                     if path.stat().st_size == remote_size:
-                        return True
-            except Exception:
-                ...
+                        if su: self.addInfoToDownload.emit(f"   ✓ 下载完成: {path.name}")
+                        return True, path.name
+            except Exception: ...
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        for attempt in range(3):  # 三次重试
+        for attempt in range(cfg.downloadCount.value):  # 重试
             try:
-                headResp = requests.head(url, timeout=10) if headResp is None else headResp
-                if headResp.status_code != 200: raise Exception
-                with requests.get(url, stream=True, timeout=10) as resp: ...
-            except Exception:
-                ...
+                headResp = requests.head(url, timeout=cfg.downloadTimeout.value) if headResp is None else headResp
+                if headResp.status_code != 200: raise ValueError("网络错误")
+                with requests.get(url, stream=True, timeout=cfg.downloadTimeout.value) as resp:
+                    resp.raise_for_status()
+                    with open(path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=26_2144):    # 512KB (8192 * 32)
+                            if chunk: f.write(chunk)
+                if sha1:
+                    if sha1 != fileSha1(path): raise ValueError("SHA1 值不匹配")
+                if su: self.addInfoToDownload.emit(f"   ✓ 下载完成: {path.name}")
+                return True, path.name
+            except Exception as e:
+                print(e)
+        return False, path.name
 
+    def _addInfoToDownload(self, info: str, label: QLabel = BodyLabel):
+        self.downloadInfoPage.contentLayout.insertWidget(self.downloadInfoPage.contentLayout.count() - 1, label(info))
+        print(info)
